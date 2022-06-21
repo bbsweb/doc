@@ -1,0 +1,175 @@
+---
+title: 文本分类
+---
+
+import Tabs from '@theme/Tabs';
+import TabItem from '@theme/TabItem';
+
+文本分类是一种常见的 NLP 任务，它为文本分配标签或类别。当今一些最大的公司在生产中广泛使用文本分类的许多实际应用。最流行的文本分类形式之一是情感分析，它为文本序列分配正面、负面或中性等标签。
+
+本指南将向您展示如何用 [IMDb](https://huggingface.co/datasets/imdb) 数据集训练 [DistilBERT](https://huggingface.co/distilbert-base-uncased)，以确定电影评论是正面的还是负面的。
+
+## 加载 IMDb 数据集
+
+```python
+from datasets import load_dataset
+
+imdb = load_dataset("imdb")
+```
+
+查看数据：
+
+```python
+imdb["test"][0]
+```
+
+该数据集有两个字段：
+
+* text：电影评论
+* label：0 或 1，代表差评和好评
+
+## 预处理
+
+加载 DistilBERT 分词器来处理 text 字段：
+
+```python
+from transformers import AutoTokenizer
+
+tokenizer = AutoTokenizer.from_pretrained("distilbert-base-uncased")
+```
+
+创建一个预处理函数来标记 text 和截断序列，使其不超过 DistilBERT 的最大输入长度：
+
+```python
+def preprocess_function(examples):
+    return tokenizer(examples["text"], truncation=True)
+```
+
+使用 map 函数将预处理函数应用于整个数据集。您可以通过设置 `batched=True` 一次处理多个数据来加速预处理
+
+```python
+tokenized_imdb = imdb.map(preprocess_function, batched=True)
+```
+
+使用 DataCollat​​orWithPadding 创建一批示例。它还会动态地将您的文本填充到其批次中最长元素的长度，因此它们是统一的长度。虽然可以在 tokenizer 函数中设置 padding=True 自动填充文本，但动态填充更有效。
+
+<Tabs groupId="framework">
+<TabItem value="pytorch" label="Pytorch">
+
+```python
+from transformers import DataCollatorWithPadding
+
+data_collator = DataCollatorWithPadding(tokenizer=tokenizer)
+```
+
+</TabItem>
+<TabItem value="tensorFlow" label="TensorFlow">
+
+```python
+from transformers import DataCollatorWithPadding
+
+data_collator = DataCollatorWithPadding(tokenizer=tokenizer, return_tensors="tf")
+```
+
+</TabItem>
+</Tabs>
+
+## 训练
+
+<Tabs groupId="framework">
+<TabItem value="pytorch" label="Pytorch">
+
+使用 AutoModelForSequenceClassification 加载 DistilBERT 模型并设置标签数量：
+
+```python
+from transformers import AutoModelForSequenceClassification, TrainingArguments, Trainer
+
+model = AutoModelForSequenceClassification.from_pretrained("distilbert-base-uncased", num_labels=2)
+```
+
+此时，还剩下三步：
+
+* 在 TrainingArguments 中定义您的训练超参数。
+* 将训练参数连同模型、数据集、标记器和数据整理器一起传递给 Trainer。
+* 调用 `train()` 开始训练。
+
+```python
+training_args = TrainingArguments(
+    output_dir="./results",
+    learning_rate=2e-5,
+    per_device_train_batch_size=16,
+    per_device_eval_batch_size=16,
+    num_train_epochs=5,
+    weight_decay=0.01,
+)
+
+trainer = Trainer(
+    model=model,
+    args=training_args,
+    train_dataset=tokenized_imdb["train"],
+    eval_dataset=tokenized_imdb["test"],
+    tokenizer=tokenizer,
+    data_collator=data_collator,
+)
+
+trainer.train()
+```
+
+</TabItem>
+<TabItem value="tensorFlow" label="TensorFlow">
+
+要在 TensorFlow 中训练模型，首先使用 `to_tf_dataset` 函数将数据集转换 tf.data.Dataset 在 columns 中指定输入和标签，以及是否打乱数据集顺序、批量大小和数据整理器：
+
+```python
+tf_train_set = tokenized_imdb["train"].to_tf_dataset(
+    columns=["attention_mask", "input_ids", "label"],
+    shuffle=True,
+    batch_size=16,
+    collate_fn=data_collator,
+)
+
+tf_validation_set = tokenized_imdb["test"].to_tf_dataset(
+    columns=["attention_mask", "input_ids", "label"],
+    shuffle=False,
+    batch_size=16,
+    collate_fn=data_collator,
+)
+```
+
+设置优化器、学习率和一些训练超参数：
+
+```python
+from transformers import create_optimizer
+import tensorflow as tf
+
+batch_size = 16
+num_epochs = 5
+batches_per_epoch = len(tokenized_imdb["train"]) // batch_size
+total_train_steps = int(batches_per_epoch * num_epochs)
+optimizer, schedule = create_optimizer(init_lr=2e-5, num_warmup_steps=0, num_train_steps=total_train_steps)
+```
+
+使用 TFAutoModelForSequenceClassification 加载 DistilBERT 模型并设置标签数量：
+
+```python
+from transformers import TFAutoModelForSequenceClassification
+
+model = TFAutoModelForSequenceClassification.from_pretrained("distilbert-base-uncased", num_labels=2)
+```
+
+编译模型
+
+```python
+import tensorflow as tf
+
+model.compile(optimizer=optimizer)
+```
+
+开始训练
+
+```python
+model.fit(x=tf_train_set, validation_data=tf_validation_set, epochs=3)
+```
+
+</TabItem>
+</Tabs>

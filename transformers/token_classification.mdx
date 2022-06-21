@@ -1,0 +1,219 @@
+---
+title: 词语分类
+---
+
+import Tabs from '@theme/Tabs';
+import TabItem from '@theme/TabItem';
+
+词语分类为句子中的各个词语分配标签。最常见的词语分类任务之一是命名实体识别 (NER)。NER 尝试为句子中的每个实体（例如人、位置或组织）查找标签。
+
+本指南将向您展示如何使用 [WNUT 17](https://huggingface.co/datasets/wnut_17) 数据集上训练 [DistilBERT](https://huggingface.co/distilbert-base-uncased) 模型以检测新实体。
+
+## 加载 WNUT 17 数据集
+
+```python
+from datasets import load_dataset
+
+wnut = load_dataset("wnut_17")
+```
+
+查看数据：
+
+```python
+wnut["train"][0]
+```
+
+`ner_tags` 中的每个数字代表一个实体。将数字转换为标签名称以获取更多信息：
+
+```python
+label_list = wnut["train"].features[f"ner_tags"].feature.names
+label_list
+```
+
+`ner_tag` 描述了一个实体，例如公司、地点或人物。每个 `ner_tag` 前缀字母表示实体的词语位置：
+
+* B - 表示实体的开始。
+* I - 表示词语包含在同一实体内（例如，单词 State 是 Empire State Building 实体的一部分）。
+* 0 - 表示词语不对应于任何实体。
+
+## 预处理
+
+加载 DistilBERT 分词器来处理 `tokens`：
+
+```python
+from transformers import AutoTokenizer
+
+tokenizer = AutoTokenizer.from_pretrained("distilbert-base-uncased")
+```
+
+由于输入已经被拆分为单词，设置 `is_split_into_words=True` 为将单词标记为子词：
+
+```python
+tokenized_input = tokenizer(example["tokens"], is_split_into_words=True)
+tokens = tokenizer.convert_ids_to_tokens(tokenized_input["input_ids"])
+tokens
+```
+
+添加特殊标记 `[CLS]` 和 `[SEP]` 会导致输入和标签不匹配。对应于标签的词语可以分成两个子词。您需要通过以下方式重新对齐词语和标签：
+
+* 使用 `word_ids` 方法将所有标记映射到其对应的单词。
+* 将标签 `-100` 分配给特殊标记 `[CLS]` `[SEP]` 让 PyTorch 损失函数忽略它们。
+* 仅给单词的第一个标记附上标签。同一单词的其他子标记则附上 `-100`。
+
+以下是如何创建一个函数来重新对齐标记和标签，并将序列截断为不超过 DistilBERT 的最大输入长度：
+
+```python
+def tokenize_and_align_labels(examples):
+    tokenized_inputs = tokenizer(examples["tokens"], truncation=True, is_split_into_words=True)
+
+    labels = []
+    for i, label in enumerate(examples[f"ner_tags"]):
+        word_ids = tokenized_inputs.word_ids(batch_index=i)  # Map tokens to their respective word.
+        previous_word_idx = None
+        label_ids = []
+        for word_idx in word_ids:  # Set the special tokens to -100.
+            if word_idx is None:
+                label_ids.append(-100)
+            elif word_idx != previous_word_idx:  # Only label the first token of a given word.
+                label_ids.append(label[word_idx])
+            else:
+                label_ids.append(-100)
+            previous_word_idx = word_idx
+        labels.append(label_ids)
+
+    tokenized_inputs["labels"] = labels
+    return tokenized_inputs
+```
+
+使用 map 函数在整个数据集上标记和对齐标签。您可以通过设置 `batched=True` 一次处理多个数据来加速预处理
+
+```python
+tokenized_wnut = wnut.map(tokenize_and_align_labels, batched=True)
+```
+
+使用 DataCollatorForTokenClassification 创建一批示例。它还会动态地将您的文本填充到其批次中最长元素的长度，因此它们是统一的长度。虽然可以在 tokenizer 函数中设置 padding=True 自动填充文本，但动态填充更有效。
+
+<Tabs groupId="framework">
+<TabItem value="pytorch" label="Pytorch">
+
+```python
+from transformers import DataCollatorForTokenClassification
+
+data_collator = DataCollatorForTokenClassification(tokenizer=tokenizer)
+```
+
+</TabItem>
+<TabItem value="tensorFlow" label="TensorFlow">
+
+```python
+from transformers import DataCollatorForTokenClassification
+
+data_collator = DataCollatorForTokenClassification(tokenizer=tokenizer, return_tensors="tf")
+```
+
+</TabItem>
+</Tabs>
+
+## 训练
+
+<Tabs groupId="framework">
+<TabItem value="pytorch" label="Pytorch">
+
+使用 AutoModelForTokenClassification 加载 DistilBERT 模型并设置标签数量：
+
+```python
+from transformers import AutoModelForTokenClassification, TrainingArguments, Trainer
+
+model = AutoModelForTokenClassification.from_pretrained("distilbert-base-uncased", num_labels=14)
+```
+
+此时，还剩下三步：
+
+* 在 TrainingArguments 中定义您的训练超参数。
+* 将训练参数连同模型、数据集、标记器和数据整理器一起传递给 Trainer。
+* 调用 `train()` 开始训练。
+
+```python
+training_args = TrainingArguments(
+    output_dir="./results",
+    evaluation_strategy="epoch",
+    learning_rate=2e-5,
+    per_device_train_batch_size=16,
+    per_device_eval_batch_size=16,
+    num_train_epochs=3,
+    weight_decay=0.01,
+)
+
+trainer = Trainer(
+    model=model,
+    args=training_args,
+    train_dataset=tokenized_wnut["train"],
+    eval_dataset=tokenized_wnut["test"],
+    tokenizer=tokenizer,
+    data_collator=data_collator,
+)
+
+trainer.train()
+```
+
+</TabItem>
+<TabItem value="tensorFlow" label="TensorFlow">
+
+要在 TensorFlow 中训练模型，首先使用 `to_tf_dataset` 函数将数据集转换 tf.data.Dataset 在 columns 中指定输入和标签，以及是否打乱数据集顺序、批量大小和数据整理器：
+
+```python
+tf_train_set = tokenized_wnut["train"].to_tf_dataset(
+    columns=["attention_mask", "input_ids", "labels"],
+    shuffle=True,
+    batch_size=16,
+    collate_fn=data_collator,
+)
+
+tf_validation_set = tokenized_wnut["validation"].to_tf_dataset(
+    columns=["attention_mask", "input_ids", "labels"],
+    shuffle=False,
+    batch_size=16,
+    collate_fn=data_collator,
+)
+```
+
+设置优化器、学习率和一些训练超参数：
+
+```python
+from transformers import create_optimizer
+
+batch_size = 16
+num_train_epochs = 3
+num_train_steps = (len(tokenized_wnut["train"]) // batch_size) * num_train_epochs
+optimizer, lr_schedule = create_optimizer(
+    init_lr=2e-5,
+    num_train_steps=num_train_steps,
+    weight_decay_rate=0.01,
+    num_warmup_steps=0,
+)
+```
+
+使用 TFAutoModelForTokenClassification 加载 DistilBERT 模型并设置标签数量：
+
+```python
+from transformers import TFAutoModelForTokenClassification
+
+model = TFAutoModelForTokenClassification.from_pretrained("distilbert-base-uncased", num_labels=2)
+```
+
+编译模型
+
+```python
+import tensorflow as tf
+
+model.compile(optimizer=optimizer)
+```
+
+开始训练
+
+```python
+model.fit(x=tf_train_set, validation_data=tf_validation_set, epochs=3)
+```
+
+</TabItem>
+</Tabs>

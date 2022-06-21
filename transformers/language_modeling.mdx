@@ -1,0 +1,338 @@
+---
+title: 语言建模
+---
+
+import Tabs from '@theme/Tabs';
+import TabItem from '@theme/TabItem';
+
+语言建模预测句子中的单词。主要有两种形式：
+
+* 因果语言建模
+* 掩码语音建模
+
+本指南将向您展示如何在 [r/askscience](https://www.reddit.com/r/askscience/) 子集 [ELI5](https://huggingface.co/datasets/eli5) 数据集上微调 `DistilGPT2` 以进行因果语言建模和 `DistilRoBERTa` 进行掩码语言建模。
+
+## 加载 ELI5 数据集
+
+仅加载 ELI5 数据集的前 5000 行，因为它非常大：
+```python
+from datasets import load_dataset
+
+eli5 = load_dataset("eli5", split="train_asks[:5000]")
+```
+
+将数据集拆分为训练集和测试集
+```python
+eli5 = eli5.train_test_split(test_size=0.2)
+```
+
+查看其中一个数据
+```python
+eli5["train"][0]
+```
+
+## 预处理
+
+对于因果语言建模，加载 DistilGPT2 分词器
+```python
+from transformers import AutoTokenizer
+
+tokenizer = AutoTokenizer.from_pretrained("distilgpt2")
+```
+
+对于掩码语言建模，则加载 DistilRoBERTa 分词器
+```python
+from transformers import AutoTokenizer
+
+tokenizer = AutoTokenizer.from_pretrained("distilroberta-base")
+```
+
+使用 `flatten` 方法将 text 字段从嵌套结构中提取出来：
+```python
+eli5 = eli5.flatten()
+eli5["train"][0]
+```
+
+创建一个预处理函数以将列表转换为字符串，并将序列截断为不超过 DistilGPT2 的最大输入长度：
+
+```python
+def preprocess_function(examples):
+    return tokenizer([" ".join(x) for x in examples["answers.text"]], truncation=True)
+```
+
+使用 `map` 函数将预处理过程应用于整个数据集。您可以通过设置 `batched=True` 一次处理数据集的多个元素并使用 `num_proc` 增加处理器数量。并删除不需要的列：
+```python
+tokenized_eli5 = eli5.map(
+    preprocess_function,
+    batched=True,
+    num_proc=4,
+    remove_columns=eli5["train"].column_names,
+)
+```
+
+现在您需要第二个预处理函数来捕获被截断的文本，以防止信息丢失。这个预处理函数应该：
+
+* 连接所有文本
+* 将连接的文本拆分为 block_size 大小
+
+```python
+block_size = 128
+
+
+def group_texts(examples):
+    concatenated_examples = {k: sum(examples[k], []) for k in examples.keys()}
+    total_length = len(concatenated_examples[list(examples.keys())[0]])
+    result = {
+        k: [t[i : i + block_size] for i in range(0, total_length, block_size)]
+        for k, t in concatenated_examples.items()
+    }
+    result["labels"] = result["input_ids"].copy()
+    return result
+```
+
+将 `group_texts` 函数应用于整个数据集：
+```python
+lm_dataset = tokenized_eli5.map(group_texts, batched=True, num_proc=4)
+```
+
+对于因果语言建模，使用 DataCollat​​orForLanguageModeling 创建一批示例。它还会动态地将您的文本填充到其批次中最长元素的长度，因此它们是统一的长度。虽然可以在 tokenizer 设置函数填充文本，但设置 `padding=True` 进行填充更便捷有效。
+
+您可以使用序列结束标记作为填充标记，并设置mlm=False. 这将使用输入作为向右移动一个元素的标签：
+
+<Tabs groupId="framework">
+<TabItem value="pytorch" label="Pytorch">
+
+```python
+from transformers import DataCollatorForLanguageModeling
+
+tokenizer.pad_token = tokenizer.eos_token
+data_collator = DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm=False)
+```
+
+</TabItem>
+<TabItem value="tensorFlow" label="TensorFlow">
+
+```python
+from transformers import DataCollatorForLanguageModeling
+
+data_collator = DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm=False, return_tensors="tf")
+```
+
+</TabItem>
+</Tabs>
+
+对于掩码语言建模，同样使用 DataCollat​​orForLanguageModeling ，同时还需要指定 mlm_probability 在每次迭代数据时随机掩码分词。
+
+<Tabs groupId="framework">
+<TabItem value="pytorch" label="Pytorch">
+
+```python
+from transformers import DataCollatorForLanguageModeling
+
+tokenizer.pad_token = tokenizer.eos_token
+data_collator = DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm_probability=0.15)
+```
+
+</TabItem>
+<TabItem value="tensorFlow" label="TensorFlow">
+
+```python
+from transformers import DataCollatorForLanguageModeling
+
+data_collator = DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm=False, return_tensors="tf")
+```
+
+</TabItem>
+</Tabs>
+
+## 因果语言建模
+
+因果语言建模经常用于文本生成。本节向您展示如何微调 DistilGPT2 以生成新文本。
+
+<Tabs groupId="framework">
+<TabItem value="pytorch" label="Pytorch">
+
+使用 AutoModelForCausalLM 加载 DistilGPT2：
+
+```python
+from transformers import AutoModelForCausalLM, TrainingArguments, Trainer
+
+model = AutoModelForCausalLM.from_pretrained("distilgpt2")
+```
+
+进行到这里，还剩下三个步骤：
+1. 在 TrainingArguments 中定义您的超参数。
+2. 将训练参数连同模型、数据集和数据整理器一起传递给 Trainer。
+3. 调用 `train()` 来微调你的模型。
+
+```python
+training_args = TrainingArguments(
+    output_dir="./results",
+    evaluation_strategy="epoch",
+    learning_rate=2e-5,
+    weight_decay=0.01,
+)
+
+trainer = Trainer(
+    model=model,
+    args=training_args,
+    train_dataset=lm_dataset["train"],
+    eval_dataset=lm_dataset["test"],
+    data_collator=data_collator,
+)
+
+trainer.train()
+```
+
+</TabItem>
+<TabItem value="tensorFlow" label="TensorFlow">
+
+要在 TensorFlow 中微调模型，首先使用 `to_tf_dataset` 将数据集转换 tf.data.Dataset. 在 columns 中指定输入和标签，以及是否打乱数据集顺序、批量大小和数据整理器：
+
+```python
+tf_train_set = lm_dataset["train"].to_tf_dataset(
+    columns=["attention_mask", "input_ids", "labels"],
+    dummy_labels=True,
+    shuffle=True,
+    batch_size=16,
+    collate_fn=data_collator,
+)
+
+tf_test_set = lm_dataset["test"].to_tf_dataset(
+    columns=["attention_mask", "input_ids", "labels"],
+    dummy_labels=True,
+    shuffle=False,
+    batch_size=16,
+    collate_fn=data_collator,
+)
+```
+
+设置优化器、学习率和一些训练超参数：
+
+```python
+from transformers import create_optimizer, AdamWeightDecay
+
+optimizer = AdamWeightDecay(learning_rate=2e-5, weight_decay_rate=0.01)
+```
+
+使用 TFAutoModelForCausalLM 加载 DistilGPT2：
+
+```python
+from transformers import TFAutoModelForCausalLM
+
+model = TFAutoModelForCausalLM.from_pretrained("distilgpt2")
+```
+
+调用 `compile` 对模型进行编译：
+
+```python
+import tensorflow as tf
+
+model.compile(optimizer=optimizer)
+```
+
+调用 `fit` 训练模型：
+
+```python
+model.fit(x=tf_train_set, validation_data=tf_test_set, epochs=3)
+```
+
+</TabItem>
+</Tabs>
+
+## 掩码语言建模
+
+掩码语言建模也称为填充掩码任务，因为它预测序列中的掩码分词。掩码语言建模模型需要对整个序列有良好的上下文理解。本节向您展示如何微调 DistilRoBERTa 以预测被掩码的单词。
+
+<Tabs groupId="framework">
+<TabItem value="pytorch" label="Pytorch">
+
+使用 AutoModelForMaskedlM 加载 DistilRoBERTa：
+
+```python
+from transformers import AutoModelForMaskedLM
+
+model = AutoModelForMaskedLM.from_pretrained("distilroberta-base")
+```
+
+此时，只剩下三个步骤：
+
+1. 在 TrainingArguments 中定义您的训练超参数。
+2. 将训练参数连同模型、数据集和数据整理器一起传递给 Trainer。
+3. 调用 `train()` 来微调你的模型。
+
+```python
+training_args = TrainingArguments(
+    output_dir="./results",
+    evaluation_strategy="epoch",
+    learning_rate=2e-5,
+    num_train_epochs=3,
+    weight_decay=0.01,
+)
+
+trainer = Trainer(
+    model=model,
+    args=training_args,
+    train_dataset=lm_dataset["train"],
+    eval_dataset=lm_dataset["test"],
+    data_collator=data_collator,
+)
+
+trainer.train()
+```
+
+</TabItem>
+<TabItem value="tensorFlow" label="TensorFlow">
+
+要在 TensorFlow 中微调模型，首先使用 `to_tf_dataset` 将数据集转换 tf.data.Dataset. 在 columns 中指定输入和标签，以及是否打乱数据集顺序、批量大小和数据整理器：
+
+```python
+tf_train_set = lm_dataset["train"].to_tf_dataset(
+    columns=["attention_mask", "input_ids", "labels"],
+    dummy_labels=True,
+    shuffle=True,
+    batch_size=16,
+    collate_fn=data_collator,
+)
+
+tf_test_set = lm_dataset["test"].to_tf_dataset(
+    columns=["attention_mask", "input_ids", "labels"],
+    dummy_labels=True,
+    shuffle=False,
+    batch_size=16,
+    collate_fn=data_collator,
+)
+```
+
+设置优化器、学习率和一些训练超参数：
+
+```python
+from transformers import create_optimizer, AdamWeightDecay
+
+optimizer = AdamWeightDecay(learning_rate=2e-5, weight_decay_rate=0.01)
+```
+
+使用 TFAutoModelForMaskedLM 加载 DistilRoBERTa：
+
+```python
+from transformers import TFAutoModelForMaskedLM
+
+model = TFAutoModelForCausalLM.from_pretrained("distilroberta-base")
+```
+
+调用 `compile` 对模型进行编译：
+
+```python
+import tensorflow as tf
+
+model.compile(optimizer=optimizer)
+```
+
+调用 `fit` 训练模型：
+
+```python
+model.fit(x=tf_train_set, validation_data=tf_test_set, epochs=3)
+```
+
+</TabItem>
+</Tabs>

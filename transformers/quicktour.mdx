@@ -1,0 +1,82 @@
+---
+title: 快速教程
+slug: /
+---
+
+import Tabs from '@theme/Tabs';
+import TabItem from '@theme/TabItem';
+
+## 管道（Pipeline）
+
+`pipeline()` 是使用预训练模型完成任务的最简单方法。
+
+`pipeline()` 有许多开箱即用的功能
+
+**文本**
+
+* 情感分析（Sentiment analysis）：对给定文本的极性进行分类。
+* 文本生成（英文）：通过给定的输入生成文本。
+* 名称实体识别（NER）：用对应的实体（人、日期、位置等）标记每个单词。
+* 问答：给定一些上下文和一个问题，从该上下文中提取答案。
+* 完形填空：补充文本的空白处。
+* 摘要：从长文本或文档中生成摘要。
+* 翻译：将文本翻译成另一种语言。
+* 特征提取：将文本转为向量。
+
+**图像**
+
+* 图像分类：对图像进行分类。
+* 图像分割：对图像中的每个像素进行分类。
+* 物体检测：检测图像中的物体。
+
+**音频**
+
+* 音频分类：为给定的音频片段分配标签。
+* 语音识别 (ASR)：将音频数据转录为文本。
+
+### 管道（Pipeline）使用
+
+在以下示例中，您将使用 pipeline() 进行文本情感分析。
+
+请先安装以下依赖项：
+
+<Tabs groupId="framework">
+<TabItem value="pytorch" label="Pytorch">
+
+```bash
+pip install torch
+```
+
+</TabItem>
+<TabItem value="tensorFlow" label="TensorFlow">
+
+```bash
+pip install tensorflow
+```
+
+</TabItem>
+</Tabs>
+
+导入 pipeline() 并指定要完成的任务：
+
+```python
+from transformers import pipeline
+
+classifier = pipeline("sentiment-analysis")
+```
+
+管道下载并缓存一个默认的[预训练模型](https://huggingface.co/distilbert-base-uncased-finetuned-sst-2-english)和分词器以进行情感分析。现在您可以使用 classifier 函数分析目标文本情感：
+
+```python
+classifier("We are very happy to show you the 🤗 Transformers library.")
+```
+
+### 在管道中指定模型和分词器
+
+## `AutoClass`
+
+### `AutoTokenizer`
+
+### `AutoModel`
+
+### 保存模型
